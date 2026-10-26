@@ -87,10 +87,16 @@ PROFILES = {
         # keeps sweet's single homogeneous cluster: fine for bring-up, revisit
         # for cpufreq/scheduling once the kernel boots with cpus=8.
         cpu_clocks=[1804800000] * 4 + [2419200000] * 3 + [3187200000],
-        # Upper DDR bank: NOT derivable from the device tree (the /memory node
-        # is all zeroes, the bootloader fills it in). Set with --high-mem-size
-        # from the phone's /proc/iomem. 8 GiB SKU = 0x1_7cc00000.
-        high_mem_size=None,
+        # Upper DDR bank. The dtb cannot tell us (its /memory reg is zeroed and
+        # the bootloader fills it in), so this comes from the phone itself:
+        # MemTotal 7797180 kB => an 8 GiB SKU, i.e. DRAM spans
+        # 0x80000000..0x280000000 with the bank boundary at 4 GiB.
+        # 6 GiB minus the 0x3400000 the bootloader keeps at the top, the same
+        # reservation sweet's live FDT shows. The value ends 64 MiB below the
+        # physical end, so even if this board reserves more, we stay inside RAM.
+        # (An over-declared dram-size makes XNU touch absent memory and hang;
+        # under-declaring only wastes RAM, so the margin errs the safe way.)
+        high_mem_size=0x17cc00000,
     ),
 }
 
