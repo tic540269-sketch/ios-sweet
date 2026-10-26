@@ -2,7 +2,13 @@
 # Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
 set -euo pipefail
 cd "$(dirname "$0")"
-CC=aarch64-linux-gnu-gcc
+# Ubuntu ships no mkbootimg package, so use the vendored packer (header v2,
+# same CLI subset). Override MKBOOTIMG if you have the AOSP one.
+MKBOOTIMG=${MKBOOTIMG:-python3 ../tools/mkbootimg_v2.py}
+# The dtb ABL gets handed along with the shim. Default stays the sweet path;
+# for another board point it at that board's own base dtb.
+DTB=${DTB:-../dtb/boot_unpacked/dtb}
+CC=${CC:-aarch64-linux-gnu-gcc}
 OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 mkdir -p out
@@ -26,8 +32,8 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
-	--dtb ../dtb/boot_unpacked/dtb --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
+$MKBOOTIMG --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
+	--dtb "$DTB" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
 	--cmdline "console=null" -o out/shim-boot.img
