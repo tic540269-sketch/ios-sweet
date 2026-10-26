@@ -10,7 +10,11 @@ MKBOOTIMG=${MKBOOTIMG:-python3 ../tools/mkbootimg_v2.py}
 DTB=${DTB:-../dtb/boot_unpacked/dtb}
 CC=${CC:-aarch64-linux-gnu-gcc}
 OBJCOPY=aarch64-linux-gnu-objcopy
+# BOARD selects per-board shim constants (see shim.c): sweet (default) or penrose.
+BOARD=${BOARD:-sweet}
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+[ "$BOARD" = sweet ] || CFLAGS="$CFLAGS -DBOARD_$(echo "$BOARD" | tr '[:lower:]' '[:upper:]')"
+echo "board: $BOARD   dtb: $DTB"
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o

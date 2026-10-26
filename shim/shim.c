@@ -12,9 +12,18 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+/* qcom,msm-imem restart_reason@65c. The IMEM base differs per SoC:
+ * sweet SM7150 msm-imem@146aa000, penrose SM8250 msm-imem@146bf000
+ * (both from the stock vendor_boot dtb). Getting this wrong does not
+ * stop the shim, but a panic then reboots into Android instead of
+ * fastboot, which costs a manual Power+VolDown every crash. */
+#ifdef BOARD_PENROSE
+#define IMEM_RESTART_REASON	0x146bf65cUL
+#else
+#define IMEM_RESTART_REASON	0x146aa65cUL
+#endif
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
+#define PSHOLD			0x0c264000UL	/* qcom,pshold, same on both */
 
 #define GICD_BASE		0x17a00000UL
 #define GICR_BASE		0x17a60000UL
