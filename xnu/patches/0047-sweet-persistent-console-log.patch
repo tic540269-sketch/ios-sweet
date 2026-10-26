@@ -16,7 +16,7 @@
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -591,9 +596,116 @@
+@@ -591,9 +596,141 @@
  	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
@@ -74,10 +74,34 @@
 +
 +	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
 +	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++
++	/* Write the header marker FIRST: even if a later write wedges or
++	   the machine freezes before any data is flushed, the recovery
++	   tool sees that the flush path started (total 0 = no data yet). */
++	{
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = 0, .seq = 0,
++		};
++		int error;
++
++		lck_mtx_lock(&sweet_ufs_lock);
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++		if (!error) {
++			error = ufs_sync_cache();
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (error) {
++			printf("SWEET LOG: header write failed (%d), stopping\n", error);
++			return;
++		}
++	}
 +	for (;;) {
-+		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz);
 +		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
 +		if (total == flushed) {
++			(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz / 4);
 +			continue;
 +		}
 +		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
@@ -89,7 +113,7 @@
 +			uint32_t blk = off / UFS_BLOCK;
 +			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
 +			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
-+			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK / 4));
 +			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
 +			error = ufs_write_blocks(base + 1 + blk, n);
 +			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
@@ -112,6 +136,7 @@
 +			return;
 +		}
 +		flushed = total;
++		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz / 4);
 +	}
 +}
 +

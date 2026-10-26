@@ -264,3 +264,240 @@ void test_ufs(void)
 		return;
 	list_partitions(elba, nent);
 }
+
+/* ---- SWEETLOG pull: read the persistent console log (patch 0047) ----
+ *
+ * The kernel appends every console byte to a 4 MiB RAM ring and, once the
+ * userdata partition is known writable, flushes new blocks to the LAST
+ * 1025 blocks of userdata: block 0 = header ("SWEETLOG", u32 version,
+ * u32 ring size, u64 total bytes written, u64 flush seq), then the ring.
+ * Byte n of the console stream lives at ring offset n % ring size.
+ * Here we read that area back and print the tail on the framebuffer.
+ */
+
+#define SWEET_LOG_BLOCKS	1025
+
+extern char _end[];  /* logarea is placed after the whole image at runtime */
+
+/* Freestanding: __builtin_memcmp can emit an external memcmp call. */
+static int mem_eq(const void *a, const void *b, uint32_t n)
+{
+	const uint8_t *x = a, *y = b;
+	for (uint32_t i = 0; i < n; i++)
+		if (x[i] != y[i])
+			return 0;
+	return 1;
+}
+
+static void con_lines(const char *buf, uint32_t n)
+{
+	static char line[256];
+	uint32_t at = 0;
+	while (at < n) {
+		uint32_t end = at;
+		while (end < n && buf[end] != '\n')
+			end++;
+		uint32_t len = end - at;
+		if (len > sizeof(line) - 2)
+			len = sizeof(line) - 2;
+		for (uint32_t i = 0; i < len; i++) {
+			uint8_t c = (uint8_t)buf[at + i];
+			line[i] = (c >= 32 && c < 127) ? (char)c : '?';
+		}
+		line[len] = 0;
+		con_str("L", line);
+		at = end + 1;
+	}
+}
+
+/* Dump the last ~24 lines of the LAST printable run in [from, lim):
+   the end of that run is where writing stopped = freeze point. */
+static void dump_freshest(const uint8_t *buf, uint32_t from, uint32_t lim)
+{
+	uint32_t lr_start = 0, lr_len = 0, cs = 0, cl = 0;
+	for (uint32_t o = from; o <= lim; o++) {
+		uint8_t c = o < lim ? buf[o] : 0;
+		if (c && ((c >= 32 && c < 127) || c == '\n' || c == '\r' || c == '\t')) {
+			if (!cl)
+				cs = o;
+			cl++;
+			continue;
+		}
+		if (cl) {
+			lr_start = cs;
+			lr_len = cl;
+			cl = 0;
+		}
+	}
+	if (lr_len < 128) {
+		con_str("LOGPULL", "no sizable text yet");
+		return;
+	}
+	uint32_t rend = lr_start + lr_len;
+	uint32_t from2 = lr_start, lines = 0;
+	for (uint32_t o = rend; o-- > lr_start; ) {
+		if (buf[o] == '\n' && ++lines > 24) {
+			from2 = o + 1;
+			break;
+		}
+	}
+	con_lines((const char *)buf + from2, rend - from2);
+	con_str("LOGPULL", "end of dump");
+}
+
+void ufs_logpull(void)
+{
+	uint32_t ocs, st;
+	uint8_t *logarea = (uint8_t *)((((uintptr_t)_end) + 4095) & ~4095UL);
+
+	/* Host takeover, same safety checks as test_ufs. */
+	uint32_t hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
+	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+		con_str("LOGPULL", "host not enabled/ready");
+		return;
+	}
+	if (ufs_rd(REG_UTRLDBR)) {
+		con_str("LOGPULL", "requests outstanding");
+		return;
+	}
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+		con_str("LOGPULL", "list base not taken");
+		return;
+	}
+	static const uint8_t tur[6] = { 0 };
+	for (int i = 0; i < 3; i++)
+		if (!scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st))
+			break;
+
+	/* Find userdata in the GPT. */
+	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
+	if (scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st)) {
+		con_str("LOGPULL", "read MBR/GPT failed");
+		return;
+	}
+	const uint8_t *gpt = data + BLOCK;
+	if (gpt[72] == 0 && gpt[73] == 0 && gpt[74] == 0 && gpt[75] == 0) {
+		con_str("LOGPULL", "no GPT");
+		return;
+	}
+	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16;
+	uint32_t elba = gpt[72] | gpt[73] << 8;
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	uint32_t eb = (nent * 128 + BLOCK - 1) / BLOCK;
+	if (read_blocks(elba, eb, ents)) {
+		con_str("LOGPULL", "read GPT entries failed");
+		return;
+	}
+	uint64_t first = 0, nblk = 0;
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		uint64_t f = le64(e + 32), l = le64(e + 40);
+		if (!f)
+			continue;
+		char name[17];
+		for (int c = 0; c < 16; c++) {
+			uint8_t ch = e[56 + 2 * c];
+			name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
+		}
+		name[16] = 0;
+		if (!__builtin_strcmp(name, "userdata")) {
+			first = f;
+			nblk = l - f + 1;
+			break;
+		}
+	}
+	if (!first || nblk < SWEET_LOG_BLOCKS) {
+		con_str("LOGPULL", "userdata not found/too small");
+		return;
+	}
+	uint64_t base = first + nblk - SWEET_LOG_BLOCKS;
+	con_hex2("LOGPULL", "area lba=", (uint32_t)base, "blocks=", SWEET_LOG_BLOCKS);
+
+	/* Read header + ring, 256 KiB per SCSI command (larger single
+	   transfers fail on this controller). */
+	for (uint32_t off = 0; off < SWEET_LOG_BLOCKS; off += 64) {
+		uint32_t n = SWEET_LOG_BLOCKS - off;
+		if (n > 64)
+			n = 64;
+		if (read_blocks((uint32_t)(base + off), n, logarea + off * BLOCK)) {
+			con_str("LOGPULL", "area read failed");
+			return;
+		}
+	}
+
+	/* 4 MiB scratch right past the image: safe in LOGPULL mode, which
+	   never boots xnu (and thus never touches the ramdisk region). */
+	uint32_t lim = SWEET_LOG_BLOCKS * BLOCK;
+	static const char magic[8] = "SWEETLOG";
+	uint32_t magic_at = 0xffffffff;
+
+	if (mem_eq(logarea, magic, 8)) {
+		magic_at = 0;
+	} else {
+		/* Forensics: the header block was never written (or was
+		   written elsewhere).  Scan the whole area for the magic
+		   and for kernel log signatures, then dump the freshest
+		   text: the flush writes ring data FIRST and the header
+		   LAST, so an interrupted flush leaves log text with no
+		   header.  The end of the last printable run is exactly
+		   where the kernel stopped writing = freeze point. */
+		static const char sig1[8] = "BSD root";
+		static const char sig2[9] = "SWEET UFS";
+		uint32_t log_at = 0xffffffff;
+		for (uint32_t o = 0; o + 9 < lim; o++) {
+			uint8_t c = logarea[o];
+			if (magic_at == 0xffffffff && c == 'S' &&
+			    mem_eq(logarea + o, magic, 8))
+				magic_at = o;
+			if (log_at == 0xffffffff && (c == 'B' || c == 'S') &&
+			    (mem_eq(logarea + o, sig1, 8) ||
+			     mem_eq(logarea + o, sig2, 9)))
+				log_at = o;
+		}
+		if (magic_at != 0xffffffff) {
+			con_hex2("LOGPULL", "magic at +", magic_at, 0, 0);
+		} else {
+			con_str("LOGPULL", "no magic anywhere");
+		}
+		if (log_at == 0xffffffff) {
+			con_str("LOGPULL", "no log text (never flushed)");
+			return;
+		}
+		con_hex2("LOGPULL", "log at +", log_at, 0, 0);
+		dump_freshest(logarea, log_at, lim);
+		if (magic_at == 0xffffffff)
+			return;
+	}
+
+	const uint8_t *hdr = logarea + magic_at;
+	uint32_t rsize = hdr[8] | hdr[9] << 8 | hdr[10] << 16 | hdr[11] << 24;
+	uint64_t total = le64(hdr + 16);
+	con_hex2("SWEETLOG", "ring=", rsize, "total lo=", (uint32_t)total);
+	if (rsize != 4 * 1024 * 1024) {
+		con_str("SWEETLOG", "unexpected ring size");
+		return;
+	}
+	if (total == 0) {
+		/* Header marker flushed but no data committed: dump
+		   whatever text got written past the header. */
+		con_str("SWEETLOG", "total=0, dumping partial data");
+		dump_freshest(logarea, magic_at + BLOCK, lim);
+		return;
+	}
+
+	/* Linearize the last ~4 KiB of the console stream. */
+	const uint8_t *ring = hdr + BLOCK;
+	uint64_t tailn = total < 4000 ? total : 4000;
+	uint64_t start = total - tailn;
+	static char tail[4096];
+	for (uint64_t i = 0; i < tailn; i++)
+		tail[i] = (char)ring[(start + i) % rsize];
+	con_lines(tail, (uint32_t)tailn);
+	con_str("LOGPULL", "end of console log");
+}
