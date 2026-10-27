@@ -311,8 +311,9 @@ static void con_lines(const char *buf, uint32_t n)
 }
 
 /* Dump the last ~24 lines of the LAST printable run in [from, lim):
-   the end of that run is where writing stopped = freeze point. */
-static void dump_freshest(const uint8_t *buf, uint32_t from, uint32_t lim)
+   the end of that run is where writing stopped = freeze point.
+   Returns 1 if something was dumped. */
+static int dump_freshest(const uint8_t *buf, uint32_t from, uint32_t lim)
 {
 	uint32_t lr_start = 0, lr_len = 0, cs = 0, cl = 0;
 	for (uint32_t o = from; o <= lim; o++) {
@@ -330,8 +331,7 @@ static void dump_freshest(const uint8_t *buf, uint32_t from, uint32_t lim)
 		}
 	}
 	if (lr_len < 128) {
-		con_str("LOGPULL", "no sizable text yet");
-		return;
+		return 0;
 	}
 	uint32_t rend = lr_start + lr_len;
 	uint32_t from2 = lr_start, lines = 0;
@@ -343,6 +343,7 @@ static void dump_freshest(const uint8_t *buf, uint32_t from, uint32_t lim)
 	}
 	con_lines((const char *)buf + from2, rend - from2);
 	con_str("LOGPULL", "end of dump");
+	return 1;
 }
 
 void ufs_logpull(void)
@@ -476,7 +477,8 @@ void ufs_logpull(void)
 	}
 
 	const uint8_t *hdr = logarea + magic_at;
-	uint32_t rsize = hdr[8] | hdr[9] << 8 | hdr[10] << 16 | hdr[11] << 24;
+	/* layout: magic[8] version(4) size(4) total(8) seq(8) */
+	uint32_t rsize = hdr[12] | hdr[13] << 8 | hdr[14] << 16 | hdr[15] << 24;
 	uint64_t total = le64(hdr + 16);
 	con_hex2("SWEETLOG", "ring=", rsize, "total lo=", (uint32_t)total);
 	if (rsize != 4 * 1024 * 1024) {
@@ -491,13 +493,26 @@ void ufs_logpull(void)
 		return;
 	}
 
-	/* Linearize the last ~4 KiB of the console stream. */
+	/* Linearize the console stream.  If the machine froze mid-flush,
+	   blocks past the committed total may hold newer text: prefer it
+	   (scan window capped at +512 KiB, one flush cycle at most). */
 	const uint8_t *ring = hdr + BLOCK;
-	uint64_t tailn = total < 4000 ? total : 4000;
-	uint64_t start = total - tailn;
-	static char tail[4096];
-	for (uint64_t i = 0; i < tailn; i++)
-		tail[i] = (char)ring[(start + i) % rsize];
-	con_lines(tail, (uint32_t)tailn);
-	con_str("LOGPULL", "end of console log");
+	uint32_t rend = rsize;
+	if (magic_at + BLOCK + rsize > lim)
+		rend = lim - magic_at - BLOCK;
+	uint32_t hi = total + 512u * 1024u < rend ? (uint32_t)total + 512u * 1024u : rend;
+	int got = 0;
+	if (total + 4096 < hi) {
+		con_str("LOGPULL", "scanning past committed total");
+		got = dump_freshest(ring, (uint32_t)total, hi);
+	}
+	if (!got) {
+		uint64_t tailn = total < 4000 ? total : 4000;
+		uint64_t start = total - tailn;
+		static char tail[4096];
+		for (uint64_t i = 0; i < tailn; i++)
+			tail[i] = (char)ring[(start + i) % rsize];
+		con_lines(tail, (uint32_t)tailn);
+		con_str("LOGPULL", "end of console log");
+	}
 }

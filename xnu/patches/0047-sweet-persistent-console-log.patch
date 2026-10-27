@@ -16,7 +16,7 @@
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -591,9 +596,141 @@
+@@ -591,9 +596,148 @@
  	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
@@ -94,8 +94,7 @@
 +		}
 +		lck_mtx_unlock(&sweet_ufs_lock);
 +		if (error) {
-+			printf("SWEET LOG: header write failed (%d), stopping\n", error);
-+			return;
++			printf("SWEET LOG: header write failed (%d)\n", error);
 +		}
 +	}
 +	for (;;) {
@@ -132,8 +131,16 @@
 +		}
 +		lck_mtx_unlock(&sweet_ufs_lock);
 +		if (error) {
-+			printf("SWEET LOG: write failed (%d), stopping\n", error);
-+			return;
++			/* Stay alive: one bad command must not kill the
++			   log.  Drop the unflushable delta, back off one
++			   second, and let the next cycle retry it. */
++			static uint32_t errs;
++			if (errs < 3) {
++				printf("SWEET LOG: flush error %d\n", error);
++				errs++;
++			}
++			(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz);
++			continue;
 +		}
 +		flushed = total;
 +		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz / 4);
