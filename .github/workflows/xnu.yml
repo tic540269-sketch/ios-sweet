@@ -15,6 +15,13 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      runner:
+        description: macOS runner label (switch if the queue keeps timing out)
+        type: choice
+        default: macos-14
+        options:
+          - macos-14
+          - macos-13
   push:
     branches: [main]
     paths:
@@ -36,7 +43,7 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    runs-on: ${{ inputs.runner || 'macos-14' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
